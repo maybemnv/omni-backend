@@ -18,45 +18,56 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from auction_agent import AuctionAgent, Product, Bid
 
-# Initialize rate limiter
-limiter = Limiter(key_func=get_remote_address)
+# Initialize rate limiter only if REDIS_URL is set
+if os.getenv("REDIS_URL"):
+    limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="OmniAuction API",
     description="REST API for OmniAuction Voice Agent",
     version="1.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json"
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
 )
 
-# Add rate limiter to the app
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if os.getenv("REDIS_URL"):
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    print("Rate limiting enabled with Redis")
+else:
+    print("Running without rate limiting (REDIS_URL not set)")
 
 # Initialize Redis for rate limiting
 @app.on_event("startup")
 async def startup():
-    redis_connection = redis.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
-    await FastAPILimiter.init(redis_connection)
+    # Only initialize Redis if REDIS_URL is set
+    if os.getenv("REDIS_URL"):
+        try:
+            redis_connection = redis.from_url(
+                os.getenv("REDIS_URL"),
+                encoding="utf-8",
+                decode_responses=True
+            )
+            await FastAPILimiter.init(redis_connection)
+            print("Connected to Redis for rate limiting")
+        except Exception as e:
+            print(f"Warning: Could not connect to Redis: {e}")
+            print("Rate limiting will be disabled")
 
-# CORS middleware
+# CORS middleware - allow all origins for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # React dev server
-        "http://localhost:8000",  # Local FastAPI
-        "https://your-production-domain.com"  # Replace with your production domain
-    ],
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"]
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"]  # Expose all headers
 )
 
 # WebSocket manager
 class ConnectionManager:
-    def _init_(self):
+    def __init__(self):
         self.active_connections: List[WebSocket] = []
         self.agent = AuctionAgent()
 
@@ -116,7 +127,7 @@ class VoiceCommand(BaseModel):
     response_model=List[Dict],
     summary="List all products",
     description="Retrieve a list of all available auction products",
-    dependencies=[Depends(RateLimiter(times=100, hours=1))]
+    dependencies=([Depends(RateLimiter(times=100, hours=1))] if os.getenv("REDIS_URL") else None)
 )
 async def list_products() -> List[Dict[str, Any]]:
     """Get list of all auction products"""
@@ -167,7 +178,7 @@ async def get_product(product_id: str) -> Dict[str, Any]:
     status_code=status.HTTP_201_CREATED,
     summary="Place a new bid",
     description="Submit a new bid for a product",
-    dependencies=[Depends(RateLimiter(times=10, minutes=1))],
+    dependencies=([Depends(RateLimiter(times=10, minutes=1))] if os.getenv("REDIS_URL") else None),
     responses={
         201: {"description": "Bid placed successfully"},
         400: {"description": "Invalid bid amount or auction ended"},
@@ -220,7 +231,7 @@ async def get_bid_history(product_id: str):
     response_model=Dict,
     summary="Set up auto-bidding",
     description="Configure auto-bidding for a user on a specific product",
-    dependencies=[Depends(RateLimiter(times=5, minutes=10))],
+    dependencies=([Depends(RateLimiter(times=5, minutes=10))] if os.getenv("REDIS_URL") else None),
     responses={
         200: {"description": "Auto-bid configured successfully"},
         400: {"description": "Invalid auto-bid configuration"},
@@ -341,7 +352,7 @@ def create_app() -> FastAPI:
     """
     return app
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     import uvicorn
     
     # Configure logging
