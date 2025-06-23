@@ -17,7 +17,29 @@ from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Optional, Any, Union
 from datetime import datetime, timedelta
 import json
+from pydantic import BaseModel, Field
 import os
+from auction_agent import AuctionAgent
+
+class Product(BaseModel):
+    """Represents a product in the auction system."""
+    id: str
+    name: str
+    description: str
+    starting_price: float
+    auction_end_time: datetime
+    current_highest_bid: float = 0.0
+    bidding_history: List[Dict[str, Any]] = []
+    
+    def time_remaining(self) -> str:
+        """Calculate the time remaining for the auction."""
+        remaining = self.auction_end_time - datetime.utcnow()
+        if remaining.total_seconds() <= 0:
+            return "Auction has ended"
+        days, seconds = remaining.days, remaining.seconds
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        return f"{days}d {hours}h {minutes}m remaining"
 import uvicorn
 import redis.asyncio as redis
 from starlette.requests import Request as StarletteRequest
@@ -28,7 +50,7 @@ from auction_agent import auction_agent, UserIntent, IntentType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -66,8 +88,9 @@ class WebhookResponse(BaseModel):
 
 class ConnectionManager:
     """Manages WebSocket connections for real-time updates"""
-    def _init_(self):
+    def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
+        self.agent = AuctionAgent()
 
     async def connect(self, websocket: WebSocket, session_id: str):
         """Accept a new WebSocket connection"""
@@ -220,7 +243,7 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
-if _name_ == "_main_":
+if __name__ == "_main_":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
 class BidRequest(BaseModel):
@@ -432,8 +455,8 @@ async def set_auto_bid(
 async def check_ending_auctions():
     while True:
         await asyncio.sleep(10)  # Check every 10 seconds
-        for product in manager.agent.products.values():
-            time_remaining = (product.auction_end_time - datetime.now()).total_seconds()
+        for product in manager.agent.products:  # Iterate directly over the list
+            time_remaining = (product.auction_end_time - datetime.utcnow()).total_seconds()
             if 0 < time_remaining < 60:  # Less than 1 minute remaining
                 await manager.broadcast({
                     "type": "auction_ending_soon",
@@ -476,7 +499,7 @@ def create_app() -> FastAPI:
     """
     return app
 
-if _name_ == "_main_":
+if __name__ == "_main_":
     import uvicorn
     
     # Configure logging
