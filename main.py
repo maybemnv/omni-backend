@@ -1,9 +1,18 @@
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Depends, status
+import logging
+from fastapi import (
+    FastAPI, 
+    WebSocket, 
+    WebSocketDisconnect, 
+    HTTPException, 
+    BackgroundTasks, 
+    Depends, 
+    status,
+    Request,
+    Response
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Optional, Any, Union
 from datetime import datetime, timedelta
@@ -11,94 +20,209 @@ import json
 import os
 import uvicorn
 import redis.asyncio as redis
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.requests import Request as StarletteRequest
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from auction_agent import AuctionAgent, Product, Bid
+from auction_agent import auction_agent, UserIntent, IntentType
 
-# Initialize rate limiter only if REDIS_URL is set
-if os.getenv("REDIS_URL"):
-    limiter = Limiter(key_func=get_remote_address)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(_name_)
 
+# Initialize FastAPI app
 app = FastAPI(
-    title="OmniAuction API",
-    description="REST API for OmniAuction Voice Agent",
+    title="OmniAuction Voice API",
+    description="Voice-enabled auction system using OmniDimension",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
 
-if os.getenv("REDIS_URL"):
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    print("Rate limiting enabled with Redis")
-else:
-    print("Running without rate limiting (REDIS_URL not set)")
-
-# Initialize Redis for rate limiting
-@app.on_event("startup")
-async def startup():
-    # Only initialize Redis if REDIS_URL is set
-    if os.getenv("REDIS_URL"):
-        try:
-            redis_connection = redis.from_url(
-                os.getenv("REDIS_URL"),
-                encoding="utf-8",
-                decode_responses=True
-            )
-            await FastAPILimiter.init(redis_connection)
-            print("Connected to Redis for rate limiting")
-        except Exception as e:
-            print(f"Warning: Could not connect to Redis: {e}")
-            print("Rate limiting will be disabled")
-
-# CORS middleware - allow all origins for development
+# CORS middleware - configure for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=["*"],  # Restrict in production
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"]  # Expose all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
 )
 
-# WebSocket manager
+class WebhookRequest(BaseModel):
+    """OmniDimension webhook request model"""
+    session_id: str = Field(..., description="Unique session identifier")
+    user_id: str = Field(..., description="User identifier")
+    intent: Dict[str, Any] = Field(..., description="Detected intent with parameters")
+    transcript: Optional[str] = Field(None, description="Transcribed user input")
+    confidence: float = Field(1.0, description="Confidence score of intent detection")
+
+class WebhookResponse(BaseModel):
+    """OmniDimension webhook response model"""
+    response: str = Field(..., description="Text response to be spoken")
+    end_session: bool = Field(False, description="Whether to end the session")
+    session_data: Optional[Dict[str, Any]] = Field(None, description="Session data to persist")
+
 class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-        self.agent = AuctionAgent()
+    """Manages WebSocket connections for real-time updates"""
+    def _init_(self):
+        self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, session_id: str):
+        """Accept a new WebSocket connection"""
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[session_id] = websocket
+        logger.info(f"New WebSocket connection for session {session_id}")
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, session_id: str):
+        """Disconnect a WebSocket connection"""
+        if session_id in self.active_connections:
+            del self.active_connections[session_id]
+            logger.info(f"WebSocket disconnected for session {session_id}")
+
+    async def send_to_session(self, session_id: str, message: dict) -> bool:
+        """Send a message to a specific WebSocket session"""
+        if session_id in self.active_connections:
+            try:
+                await self.active_connections[session_id].send_json(message)
+                return True
+            except (WebSocketDisconnect, RuntimeError) as e:
+                logger.error(f"WebSocket error: {e}")
+                self.disconnect(session_id)
+        return False
 
     async def broadcast(self, message: dict) -> None:
-        """Broadcast message to all active WebSocket connections.
-        
-        Args:
-            message: Dictionary containing the message to broadcast
-        """
+        """Broadcast a message to all active WebSocket connections"""
         disconnected = []
-        for connection in self.active_connections:
+        for session_id, connection in list(self.active_connections.items()):
             try:
                 await connection.send_json(message)
             except (WebSocketDisconnect, RuntimeError) as e:
-                disconnected.append(connection)
+                logger.error(f"WebSocket broadcast error: {e}")
+                disconnected.append(session_id)
         
-        # Remove disconnected clients
-        for connection in disconnected:
-            if connection in self.active_connections:
-                self.active_connections.remove(connection)
+        # Clean up disconnected clients
+        for session_id in disconnected:
+            self.disconnect(session_id)
 
+# Initialize WebSocket manager
 manager = ConnectionManager()
 
-# Models
+# Webhook endpoint for OmniDimension integration
+@app.post("/webhook")
+async def webhook_handler(webhook_request: WebhookRequest):
+    """Handle incoming webhook requests from OmniDimension"""
+    try:
+        # Parse the intent
+        intent_type = webhook_request.intent.get("name")
+        slots = webhook_request.intent.get("slots", {})
+        
+        # Create user intent
+        user_intent = UserIntent(
+            type=IntentType(intent_type) if intent_type else IntentType.HELP,
+            product_id=slots.get("product_id"),
+            amount=float(slots.get("amount")) if slots.get("amount") else None,
+            user_id=webhook_request.user_id,
+            session_id=webhook_request.session_id,
+            confidence=webhook_request.confidence
+        )
+        
+        # Process the intent
+        response_text = await auction_agent.process_voice_command(user_intent)
+        
+        # Prepare response
+        return WebhookResponse(
+            response=response_text,
+            session_data={
+                "last_intent": intent_type,
+                "last_interaction": datetime.utcnow().isoformat()
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}")
+        return WebhookResponse(
+            response="I'm sorry, I encountered an error processing your request. Please try again.",
+            end_session=False
+        )
+
+# WebSocket endpoint for real-time updates
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """Handle WebSocket connections for real-time updates"""
+    await manager.connect(websocket, session_id)
+    try:
+        while True:
+            # Keep connection alive
+            await asyncio.sleep(30)
+            await websocket.send_json({"type": "ping"})
+    except WebSocketDisconnect:
+        manager.disconnect(session_id)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        manager.disconnect(session_id)
+
+# API Endpoints
+@app.get("/api/products")
+async def list_products():
+    """Get list of all auction products"""
+    return await auction_agent.list_products()
+
+@app.get("/api/products/{product_id}")
+async def get_product(product_id: str):
+    """Get details of a specific product"""
+    return await auction_agent.get_product_info(product_id)
+
+@app.post("/api/bids")
+async def place_bid(bid: dict):
+    """Place a new bid on a product"""
+    try:
+        result = await auction_agent.place_bid(
+            product_id=bid.get("product_id"),
+            amount=bid.get("amount"),
+            user_id=bid.get("user_id", "anonymous")
+        )
+        
+        # Get the session ID from the request if available
+        session_id = bid.get("session_id")
+        if session_id:
+            # Notify the specific session about the bid result
+            await manager.send_to_session(session_id, {
+                "type": "bid_result",
+                "success": "success" in result.lower(),
+                "message": result
+            })
+        
+        return {"status": "success", "message": result}
+        
+    except Exception as e:
+        logger.error(f"Error placing bid: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to place bid: {str(e)}"
+        )
+
+@app.get("/api/products/{product_id}/bids")
+async def get_bid_history(product_id: str):
+    """Get bid history for a product"""
+    try:
+        return await auction_agent.get_bid_history(product_id)
+    except Exception as e:
+        logger.error(f"Error getting bid history: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get bid history: {str(e)}"
+        )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+if _name_ == "_main_":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 class BidRequest(BaseModel):
     """Request model for placing a bid."""
     user: str = Field(..., min_length=3, max_length=50, description="Unique user identifier")
@@ -352,7 +476,7 @@ def create_app() -> FastAPI:
     """
     return app
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     import uvicorn
     
     # Configure logging
